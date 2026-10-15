@@ -46,6 +46,14 @@ public class AdaptiveTutorialUserCommentSkill extends AdaptiveTutorialBaseSkill
 			usermessage = (String) tutorMessageContext.getContextValue("query");
 		}
 		String userId = tutorMessageContext.getUserProfile().getUser().getId();
+		// The tutorial id is the app's (context_tutorialid): a learner could name a tutorial of a topic
+		// they may not see and get its documents quoted back (2026-10-15). Not theirs = no lesson.
+		if (tutorialid != null && !canSeeTutorial(tutorMessageContext.getUserProfile(), tutorialid))
+		{
+			log.warn("Tutorial " + tutorialid + " is not visible to user " + userId + ", answering without its sources");
+			tutorialid = null;
+			sectionid = null;
+		}
 
 		// The learner's answer and the question in play: only what THIS
 		// request carried (the app's context_* ride on its system message as
@@ -84,7 +92,7 @@ public class AdaptiveTutorialUserCommentSkill extends AdaptiveTutorialBaseSkill
 
 		LlmConnection llmconnection = getMediaArchive().getLlmConnection("embedding");
 
-		JSONArray chatHistory = org ? new JSONArray() : getReleaventChatHistory(sectionid, channelid, userId);
+		JSONArray chatHistory = org || sectionid == null ? new JSONArray() : getReleaventChatHistory(sectionid, channelid, userId);
 		if (org && overview.length() > 0)
 		{
 			JSONObject item = new JSONObject();
@@ -93,7 +101,7 @@ public class AdaptiveTutorialUserCommentSkill extends AdaptiveTutorialBaseSkill
 			chatHistory.add(item);
 		}
 
-		Collection<String> parentIds = org ? new java.util.ArrayList<String>() : getAssistantManager().findDocIdsForEntity("entitytutorial", tutorialid);
+		Collection<String> parentIds = org || tutorialid == null ? new java.util.ArrayList<String>() : getAssistantManager().findDocIdsForEntity("entitytutorial", tutorialid);
 
 		String answer = null;
 		String embedkey = llmconnection.getApiKey();
@@ -1071,37 +1079,10 @@ public class AdaptiveTutorialUserCommentSkill extends AdaptiveTutorialBaseSkill
 	 * TestU IRIS tab: the reference documents of every tutorial of every topic the learner may see,
 	 * with inTopicOfDoc filled (doc id to topic name) and inOverview set to one line naming the
 	 * topics, their tutorials and section headings (the tab's lesson context, for "qué temas tienes").
-	 * Topic visibility is the platform's entity security as the topic service applies it
-	 * (BaseSearchSecurity.attachStandardSecurity, which needs a request this skill has not):
-	 * administrators see all; else a topic with securityenabled false, or listing one of the user's
-	 * groups, or owned by or viewable by the user.
 	 */
 	protected Collection<MultiValued> learnerDocuments(org.openedit.profile.UserProfile inProfile, Map<String, String> inTopicOfDoc, StringBuilder inOverview)
 	{
-		org.openedit.data.Searcher topics = getMediaArchive().getSearcher("entitytopic");
-		org.openedit.data.QueryBuilder q = topics.query().all();
-		if (inProfile == null || !inProfile.isInRole("administrator"))
-		{
-			java.util.List<String> groupids = new java.util.ArrayList<String>();
-			if (inProfile == null || inProfile.getUser() == null)
-			{
-				groupids.add("anonymous");
-			}
-			else
-			{
-				for (Object g : inProfile.getUser().getGroups())
-				{
-					groupids.add(((org.openedit.users.Group) g).getId());
-				}
-			}
-			String userid = inProfile == null || inProfile.getUserId() == null ? "null" : inProfile.getUserId();
-			q.getQuery().addChildQuery(topics.query().or().orgroup("viewgroups", groupids).exact("owner", userid).exact("viewusers", userid).exact("securityenabled", "false").getQuery());
-		}
-		Map<String, String> topicnames = new LinkedHashMap<String, String>();
-		for (Object o : q.search())
-		{
-			topicnames.put(((Data) o).getId(), ((Data) o).getName());
-		}
+		Map<String, String> topicnames = visibleTopics(inProfile);
 		Map<String, String> topicOfTutorial = new LinkedHashMap<String, String>();
 		Map<String, StringBuilder> lines = new LinkedHashMap<String, StringBuilder>();
 		if (!topicnames.isEmpty())
@@ -1150,6 +1131,51 @@ public class AdaptiveTutorialUserCommentSkill extends AdaptiveTutorialBaseSkill
 			}
 		}
 		return docs;
+	}
+
+	/**
+	 * The topics inProfile may see (id to name), the rule topics.json applies through
+	 * BaseSearchSecurity.attachStandardSecurity (which needs a request this skill has not) and
+	 * TestUSocialModule.canSeeTopic mirrors: administrators see all; else securityenabled false, or
+	 * owned by the user, or listing them in viewusers, their role (settingsrole, legacy
+	 * settingsgroup) in viewroles or one of their groups in viewgroups.
+	 */
+	protected Map<String, String> visibleTopics(org.openedit.profile.UserProfile inProfile)
+	{
+		org.openedit.data.Searcher topics = getMediaArchive().getSearcher("entitytopic");
+		org.openedit.data.QueryBuilder q = topics.query().all();
+		if (inProfile == null || !inProfile.isInRole("administrator"))
+		{
+			java.util.List<String> groupids = new java.util.ArrayList<String>();
+			if (inProfile == null || inProfile.getUser() == null)
+			{
+				groupids.add("anonymous");
+			}
+			else
+			{
+				for (Object g : inProfile.getUser().getGroups())
+				{
+					groupids.add(((org.openedit.users.Group) g).getId());
+				}
+			}
+			String userid = inProfile == null || inProfile.getUserId() == null ? "null" : inProfile.getUserId();
+			String role = inProfile == null ? null : inProfile.get("settingsrole");
+			role = role != null ? role : inProfile == null ? null : inProfile.get("settingsgroup");
+			q.getQuery().addChildQuery(topics.query().or().orgroup("viewgroups", groupids).exact("owner", userid).exact("viewusers", userid).exact("viewroles", role == null ? "null" : role).exact("securityenabled", "false").getQuery());
+		}
+		Map<String, String> topicnames = new LinkedHashMap<String, String>();
+		for (Object o : q.search())
+		{
+			topicnames.put(((Data) o).getId(), ((Data) o).getName());
+		}
+		return topicnames;
+	}
+
+	/** Whether inTutorialId's topic is one of visibleTopics(inProfile); an unknown tutorial is not. */
+	protected boolean canSeeTutorial(org.openedit.profile.UserProfile inProfile, String inTutorialId)
+	{
+		Data tutorial = getMediaArchive().getCachedData("entitytutorial", inTutorialId);
+		return tutorial != null && visibleTopics(inProfile).containsKey(tutorial.get("entitytopic"));
 	}
 
 	/** "A", "A y B", "A, B y C" — the template's off-topic sentence names them. */
